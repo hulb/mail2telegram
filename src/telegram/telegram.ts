@@ -5,6 +5,8 @@ import { Dao } from '../db';
 import { renderEmailDebugMode, renderEmailListMode, renderEmailPreviewMode, renderEmailSummaryMode, replyToEmail } from '../mail';
 import { createTelegramBotAPI } from './api';
 import { tmaModeDescription } from './const';
+import { handleListRoutesCallback, handleListRoutesCommand } from './list_routes';
+import { handleNewRouteCallback, handleNewRouteCommand, tryConsumeAwaitedPrefix } from './new_route';
 
 type TelegramMessageHandler = (message: Telegram.Message) => Promise<Response>;
 type CommandHandlerGroup = Record<string, TelegramMessageHandler>;
@@ -134,6 +136,7 @@ async function handleReplyEmailCommand(message: Telegram.Message, env: Environme
 }
 
 async function telegramCommandHandler(message: Telegram.Message, env: Environment): Promise<void> {
+    const { TELEGRAM_TOKEN } = env;
     logTelegram('message.received', {
         chatId: message?.chat?.id,
         messageId: message?.message_id,
@@ -141,6 +144,9 @@ async function telegramCommandHandler(message: Telegram.Message, env: Environmen
         hasText: !!message?.text,
         isReply: !!message?.reply_to_message,
     });
+    if (await tryConsumeAwaitedPrefix(message, env)) {
+        return;
+    }
     if (message?.reply_to_message) {
         await handleReplyEmailCommand(message, env);
         return;
@@ -157,6 +163,28 @@ async function telegramCommandHandler(message: Telegram.Message, env: Environmen
         test: handleOpenTMACommand('test', null, env),
         white: handleOpenTMACommand('white', null, env),
         block: handleOpenTMACommand('block', null, env),
+        new_route: async (msg: Telegram.Message): Promise<Response> => {
+            try {
+                return await handleNewRouteCommand(msg, env);
+            } catch (e) {
+                logTelegramError('command.new_route.error', e, { command, chatId: msg.chat.id, messageId: msg.message_id });
+                return await createTelegramBotAPI(TELEGRAM_TOKEN).sendMessage({
+                    chat_id: msg.chat.id,
+                    text: (e as Error).message,
+                });
+            }
+        },
+        list_routes: async (msg: Telegram.Message): Promise<Response> => {
+            try {
+                return await handleListRoutesCommand(msg, env);
+            } catch (e) {
+                logTelegramError('command.list_routes.error', e, { command, chatId: msg.chat.id, messageId: msg.message_id });
+                return await createTelegramBotAPI(TELEGRAM_TOKEN).sendMessage({
+                    chat_id: msg.chat.id,
+                    text: (e as Error).message,
+                });
+            }
+        },
     };
 
     if (handlers[command]) {
@@ -245,6 +273,34 @@ async function telegramCallbackHandler(callback: Telegram.CallbackQuery, env: En
 
     const [act, arg] = data.split(/:(.*)/) as [string, string];
     logTelegram('callback.parsed', { data, act, arg, chatId, messageId });
+    if (act === 'nr') {
+        try {
+            await handleNewRouteCallback(callback, env);
+        } catch (e) {
+            logTelegramError('callback.new_route.error', e, { data, chatId, messageId });
+            const response = await api.answerCallbackQuery({
+                callback_query_id: callbackId,
+                text: (e as Error).message,
+                show_alert: true,
+            });
+            await logTelegramResponse('answerCallbackQuery', response);
+        }
+        return;
+    }
+    if (act === 'lr') {
+        try {
+            await handleListRoutesCallback(callback, env);
+        } catch (e) {
+            logTelegramError('callback.list_routes.error', e, { data, chatId, messageId });
+            const response = await api.answerCallbackQuery({
+                callback_query_id: callbackId,
+                text: (e as Error).message,
+                show_alert: true,
+            });
+            await logTelegramResponse('answerCallbackQuery', response);
+        }
+        return;
+    }
     if (handlers[act]) {
         try {
             await handlers[act](arg);

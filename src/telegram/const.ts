@@ -21,4 +21,12 @@ export const telegramCommands = [
         command: 'block',
         description: `/block - ${tmaModeDescription.block}`,
     },
+    {
+        command: 'new_route',
+        description: '/new_route <prefix> - Create a new email route',
+    },
+    {
+        command: 'list_routes',
+        description: '/list_routes - List and delete email routes',
+    },
 ];
