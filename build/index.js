@@ -3285,6 +3285,14 @@ var telegramCommands = [
   {
     command: "block",
     description: `/block - ${tmaModeDescription.block}`
+  },
+  {
+    command: "new_route",
+    description: "/new_route <prefix> - Create a new email route"
+  },
+  {
+    command: "list_routes",
+    description: "/list_routes - List and delete email routes"
   }
 ];
 
@@ -13309,6 +13317,562 @@ async function sendEmail(token2, from, to, subject, text) {
   });
 }
 
+// src/cloudflare/index.ts
+var API_BASE = "https://api.cloudflare.com/client/v4";
+var EMAIL_ROUTING_MX_PATTERN = /^[\w-]+\.mx\.cloudflare\.net\.?$/i;
+function validateEmailPrefix(prefix) {
+  return /^[a-z0-9][\w.-]{0,62}$/i.test(prefix);
+}
+function isValidAddressLength(address) {
+  return address.length <= 90;
+}
+function filterEmailRoutingMXRecords(records) {
+  const domains = /* @__PURE__ */ new Set();
+  for (const record of records) {
+    if (record.meta?.email_routing === true || EMAIL_ROUTING_MX_PATTERN.test(record.content)) {
+      domains.add(record.name);
+    }
+  }
+  return [...domains].sort();
+}
+function cfErrorMessage(res, data) {
+  const status = `Cloudflare API error (HTTP ${res.status})`;
+  const messages = data?.errors?.map((e) => e.message).filter(Boolean).join("; ");
+  return messages ? `${status}: ${messages}` : status;
+}
+async function cfFetchAllPages(token2, path) {
+  const all2 = [];
+  let page = 1;
+  for (; ; ) {
+    const sep = path.includes("?") ? "&" : "?";
+    const res = await fetch(`${API_BASE}${path}${sep}page=${page}&per_page=50`, {
+      headers: { Authorization: `Bearer ${token2}` }
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data) {
+      throw new Error(cfErrorMessage(res, data));
+    }
+    if (!data.success) {
+      throw new Error(cfErrorMessage(res, data));
+    }
+    all2.push(...data.result);
+    if (page >= (data.result_info?.total_pages ?? 1)) {
+      return all2;
+    }
+    page++;
+  }
+}
+async function listZones(token2) {
+  const zones = await cfFetchAllPages(token2, "/zones?status=active");
+  return zones.map((z) => ({ id: z.id, name: z.name, accountId: z.account.id }));
+}
+async function listEmailDomains(token2, zone) {
+  const records = await cfFetchAllPages(token2, `/zones/${zone.id}/dns_records?type=MX`);
+  return filterEmailRoutingMXRecords(records);
+}
+async function listDestinationAddresses(token2, accountId) {
+  const addresses = await cfFetchAllPages(token2, `/accounts/${accountId}/email/routing/addresses`);
+  return addresses.filter((a2) => a2.verified !== null).map((a2) => a2.email).sort();
+}
+async function listWorkers(token2, accountId) {
+  const scripts = await cfFetchAllPages(token2, `/accounts/${accountId}/workers/scripts`);
+  return scripts.filter((s2) => !s2.handlers || s2.handlers.includes("email")).map((s2) => s2.id).sort();
+}
+async function listRuleAddresses(token2, zoneId) {
+  const rules = await cfFetchAllPages(token2, `/zones/${zoneId}/email/routing/rules`);
+  return rules.flatMap((r2) => r2.matchers).filter((m) => m.type === "literal" && m.value).map((m) => m.value);
+}
+function mapRoutingRuleResult(rule) {
+  const matcher = rule.matchers.find((m) => m.type === "literal");
+  const action = rule.actions?.[0];
+  if (!matcher?.value || !action) {
+    return null;
+  }
+  const actionValue = action.value?.[0] || "";
+  const actionLabel = action.type === "forward" ? `\u2192 ${actionValue}` : action.type === "worker" ? `\u2192 worker ${actionValue}` : "\u2192 drop";
+  return {
+    id: rule.id,
+    address: matcher.value,
+    actionLabel,
+    source: rule.source || "api"
+  };
+}
+async function listRoutingRules(token2, zoneId) {
+  const rules = await cfFetchAllPages(token2, `/zones/${zoneId}/email/routing/rules`);
+  return rules.map(mapRoutingRuleResult).filter((r2) => r2 !== null);
+}
+async function deleteRule(token2, zoneId, ruleId) {
+  const res = await fetch(`${API_BASE}/zones/${zoneId}/email/routing/rules/${ruleId}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token2}` }
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok || !data || !data.success) {
+    throw new Error(cfErrorMessage(res, data));
+  }
+}
+async function createRule(token2, zoneId, address, action) {
+  const res = await fetch(`${API_BASE}/zones/${zoneId}/email/routing/rules`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${token2}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      name: "Created by mail2telegram bot",
+      enabled: true,
+      matchers: [{ type: "literal", field: "to", value: address }],
+      actions: [{ type: action.type, value: [action.value] }]
+    })
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok || !data || !data.success) {
+    throw new Error(cfErrorMessage(res, data));
+  }
+}
+
+// src/telegram/new_route.ts
+var TARGETS_PER_PAGE = 10;
+var STATE_TTL = 3600;
+var AWAIT_PREFIX_TTL = 300;
+var DOMAINS_CACHE_KEY = "new_route:domains:v2";
+function stateKey(id) {
+  return `new_route:state:${id}`;
+}
+function awaitPrefixKey(chatId) {
+  return `new_route:await:${chatId}`;
+}
+function parseCallbackData(data) {
+  const parts = data.split(":");
+  if (parts.length !== 4 || parts[0] !== "nr") {
+    return null;
+  }
+  const [, act, stateId, num] = parts;
+  if (!/^[a-z0-9]+$/.test(stateId) || !/^\d+$/.test(num)) {
+    return null;
+  }
+  if (act === "d" || act === "t") {
+    return { act, stateId, index: Number.parseInt(num, 10) };
+  }
+  if (act === "g") {
+    return { act, stateId, page: Number.parseInt(num, 10) };
+  }
+  return null;
+}
+function buildTargets(emails, workers) {
+  return [
+    ...emails.map((email) => ({ label: `\u{1F4E7} ${email}`, type: "forward", value: email })),
+    ...workers.map((worker) => ({ label: `\u2699\uFE0F ${worker}`, type: "worker", value: worker }))
+  ];
+}
+function buildDomainKeyboard(domains, stateId) {
+  return {
+    inline_keyboard: domains.map((d2, i2) => [{
+      text: d2.domain,
+      callback_data: `nr:d:${stateId}:${i2}`
+    }])
+  };
+}
+function buildTargetsKeyboard(targets, stateId, page) {
+  const start = page * TARGETS_PER_PAGE;
+  const keyboard = targets.slice(start, start + TARGETS_PER_PAGE).map((t2, i2) => [{
+    text: t2.label,
+    callback_data: `nr:t:${stateId}:${start + i2}`
+  }]);
+  const nav = [];
+  if (page > 0) {
+    nav.push({ text: "\u2B05\uFE0F Prev", callback_data: `nr:g:${stateId}:${page - 1}` });
+  }
+  if (start + TARGETS_PER_PAGE < targets.length) {
+    nav.push({ text: "Next \u27A1\uFE0F", callback_data: `nr:g:${stateId}:${page + 1}` });
+  }
+  if (nav.length > 0) {
+    keyboard.push(nav);
+  }
+  return { inline_keyboard: keyboard };
+}
+function isAllowedChat(env, chatId) {
+  return env.TELEGRAM_ID.split(",").map((s2) => s2.trim()).includes(`${chatId}`);
+}
+async function loadDomains(env) {
+  const cached = await env.DB.get(DOMAINS_CACHE_KEY);
+  if (cached) {
+    console.log(`[new_route] loadDomains cache_hit ${cached}`);
+    return JSON.parse(cached);
+  }
+  const token2 = env.CF_API_TOKEN;
+  const zones = await listZones(token2);
+  if (zones.length === 0) {
+    throw new Error("No zones visible to CF_API_TOKEN. Check token permissions and zone scope.");
+  }
+  const domains = [];
+  for (const zone of zones) {
+    for (const domain of await listEmailDomains(token2, zone)) {
+      domains.push({ domain, zoneId: zone.id });
+    }
+  }
+  const result = { accountId: zones[0].accountId, domains };
+  console.log(`[new_route] loadDomains zones=${zones.length} ${JSON.stringify(zones.map((z) => z.name))} domains=${JSON.stringify(domains)}`);
+  await env.DB.put(DOMAINS_CACHE_KEY, JSON.stringify(result), { expirationTtl: STATE_TTL });
+  return result;
+}
+async function saveState(env, stateId, state) {
+  await env.DB.put(stateKey(stateId), JSON.stringify(state), { expirationTtl: STATE_TTL });
+}
+async function loadState(env, stateId) {
+  const raw = await env.DB.get(stateKey(stateId));
+  return raw ? JSON.parse(raw) : null;
+}
+async function startNewRouteFlow(prefix, message, env) {
+  const api = createTelegramBotAPI(env.TELEGRAM_TOKEN);
+  const chatId = message.chat.id;
+  const reply = (text) => api.sendMessage({ chat_id: chatId, text });
+  if (!validateEmailPrefix(prefix)) {
+    return reply(`Invalid prefix "${prefix}". Use letters, digits, dot, underscore and hyphen (max 63 chars, starting with a letter or digit).`);
+  }
+  const { accountId, domains } = await loadDomains(env);
+  if (domains.length === 0) {
+    return reply("No email routing domains found. Enable Email Routing on your zone first, and check CF_API_TOKEN permissions (Zone:Read, DNS:Read).");
+  }
+  const stateId = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
+  await saveState(env, stateId, { prefix, chatId, accountId, domains });
+  return api.sendMessage({
+    chat_id: chatId,
+    text: `Create ${prefix}@\u2753 - choose a domain:`,
+    reply_markup: buildDomainKeyboard(domains, stateId)
+  });
+}
+async function handleNewRouteCommand(message, env) {
+  const api = createTelegramBotAPI(env.TELEGRAM_TOKEN);
+  const chatId = message.chat.id;
+  if (!isAllowedChat(env, chatId)) {
+    return new Response(null, { status: 200 });
+  }
+  if (!env.CF_API_TOKEN) {
+    return api.sendMessage({ chat_id: chatId, text: "Cloudflare API is not enabled (CF_API_TOKEN missing)." });
+  }
+  const args = message.text?.split(/ (.*)/)[1]?.trim() || "";
+  if (!args) {
+    await env.DB.put(awaitPrefixKey(chatId), "1", { expirationTtl: AWAIT_PREFIX_TTL });
+    return api.sendMessage({ chat_id: chatId, text: "Send me the email prefix (e.g. admin) within 5 minutes." });
+  }
+  await env.DB.delete(awaitPrefixKey(chatId));
+  return startNewRouteFlow(args, message, env);
+}
+async function tryConsumeAwaitedPrefix(message, env) {
+  const chatId = message.chat.id;
+  if (!message.text || message.text.startsWith("/") || !!message.reply_to_message || !isAllowedChat(env, chatId)) {
+    return false;
+  }
+  const key = awaitPrefixKey(chatId);
+  if (await env.DB.get(key) === null) {
+    return false;
+  }
+  await env.DB.delete(key);
+  if (!env.CF_API_TOKEN) {
+    const api = createTelegramBotAPI(env.TELEGRAM_TOKEN);
+    await api.sendMessage({ chat_id: chatId, text: "Cloudflare API is not enabled (CF_API_TOKEN missing)." });
+    return true;
+  }
+  try {
+    await startNewRouteFlow(message.text.trim(), message, env);
+  } catch (e) {
+    const api = createTelegramBotAPI(env.TELEGRAM_TOKEN);
+    await api.sendMessage({ chat_id: chatId, text: e.message });
+  }
+  return true;
+}
+async function handleNewRouteCallback(callback, env) {
+  const api = createTelegramBotAPI(env.TELEGRAM_TOKEN);
+  const chatId = callback.message?.chat?.id;
+  const messageId = callback.message?.message_id;
+  const parsed = parseCallbackData(callback.data || "");
+  if (!parsed || !chatId || !messageId) {
+    return;
+  }
+  if (!isAllowedChat(env, chatId) || !env.CF_API_TOKEN) {
+    await api.answerCallbackQuery({ callback_query_id: callback.id });
+    return;
+  }
+  const alert = (text) => api.answerCallbackQuery({
+    callback_query_id: callback.id,
+    text,
+    show_alert: true
+  });
+  const ack = () => api.answerCallbackQuery({ callback_query_id: callback.id });
+  const state = await loadState(env, parsed.stateId);
+  if (!state || state.chatId !== chatId) {
+    await alert("Session expired, run /new_route again.");
+    return;
+  }
+  const token2 = env.CF_API_TOKEN;
+  if (parsed.act === "d") {
+    const option2 = state.domains[parsed.index];
+    if (!option2) {
+      await alert("Invalid option.");
+      return;
+    }
+    const address2 = `${state.prefix}@${option2.domain}`;
+    if (!isValidAddressLength(address2)) {
+      await alert(`Address too long (over 90 chars): ${address2}`);
+      return;
+    }
+    const [emails, workers] = await Promise.all([
+      listDestinationAddresses(token2, state.accountId),
+      listWorkers(token2, state.accountId)
+    ]);
+    const targets = buildTargets(emails, workers);
+    if (targets.length === 0) {
+      await api.editMessageText({
+        chat_id: chatId,
+        message_id: messageId,
+        text: "No verified destination addresses or workers with an email handler found in this account."
+      });
+      await ack();
+      return;
+    }
+    state.domain = option2.domain;
+    state.zoneId = option2.zoneId;
+    state.targets = targets;
+    await saveState(env, parsed.stateId, state);
+    await api.editMessageText({
+      chat_id: chatId,
+      message_id: messageId,
+      text: `Create ${address2} - choose a target:
+\u{1F4E7} forward to email
+\u2699\uFE0F send to worker`,
+      reply_markup: buildTargetsKeyboard(targets, parsed.stateId, 0)
+    });
+    await ack();
+    return;
+  }
+  if (parsed.act === "g") {
+    if (!state.targets || !state.domain) {
+      await alert("Session expired, run /new_route again.");
+      return;
+    }
+    await api.editMessageText({
+      chat_id: chatId,
+      message_id: messageId,
+      text: `Create ${state.prefix}@${state.domain} - choose a target:
+\u{1F4E7} forward to email
+\u2699\uFE0F send to worker`,
+      reply_markup: buildTargetsKeyboard(state.targets, parsed.stateId, parsed.page)
+    });
+    await ack();
+    return;
+  }
+  const target = state.targets?.[parsed.index];
+  if (!target || !state.targets || !state.zoneId || !state.domain) {
+    await alert("Invalid option.");
+    return;
+  }
+  const address = `${state.prefix}@${state.domain}`;
+  const existing = await listRuleAddresses(token2, state.zoneId);
+  if (existing.includes(address)) {
+    await api.editMessageText({
+      chat_id: chatId,
+      message_id: messageId,
+      text: `\u274C ${address} already exists. Choose another target or run /new_route again.`,
+      reply_markup: buildTargetsKeyboard(state.targets, parsed.stateId, 0)
+    });
+    await ack();
+    return;
+  }
+  await createRule(token2, state.zoneId, address, { type: target.type, value: target.value });
+  await env.DB.delete(stateKey(parsed.stateId));
+  await api.editMessageText({
+    chat_id: chatId,
+    message_id: messageId,
+    text: `\u2705 Created ${address} \u2192 ${target.type === "forward" ? "forward to" : "worker"} ${target.value}`
+  });
+  await ack();
+}
+
+// src/telegram/list_routes.ts
+var RULES_PER_PAGE = 10;
+function listRoutesStateKey(id) {
+  return `list_routes:state:${id}`;
+}
+function parseListRoutesCallbackData(data) {
+  const parts = data.split(":");
+  if (parts.length !== 4 || parts[0] !== "lr") {
+    return null;
+  }
+  const [, act, stateId, num] = parts;
+  if (!/^[a-z0-9]+$/.test(stateId) || !/^\d+$/.test(num)) {
+    return null;
+  }
+  if (act === "d") {
+    return { act, stateId, index: Number.parseInt(num, 10) };
+  }
+  if (act === "p" || act === "z") {
+    return { act, stateId, page: Number.parseInt(num, 10) };
+  }
+  if (act === "c" || act === "x") {
+    return { act, stateId, ruleIndex: Number.parseInt(num, 10) };
+  }
+  return null;
+}
+function buildRuleLabel(rule) {
+  const emoji = rule.actionLabel.startsWith("\u2192 worker") ? "\u2699\uFE0F" : rule.actionLabel.startsWith("\u2192 drop") ? "\u{1F6AB}" : "\u{1F4E7}";
+  return `${emoji} ${rule.address} ${rule.actionLabel}`;
+}
+function buildListRoutesDomainKeyboard(domains, stateId) {
+  return {
+    inline_keyboard: domains.map((d2, i2) => [{
+      text: d2.domain,
+      callback_data: `lr:d:${stateId}:${i2}`
+    }])
+  };
+}
+function buildRulesKeyboard(rules, stateId, page) {
+  const start = page * RULES_PER_PAGE;
+  const keyboard = rules.slice(start, start + RULES_PER_PAGE).map((r2, i2) => [{
+    text: buildRuleLabel(r2),
+    callback_data: `lr:c:${stateId}:${start + i2}`
+  }]);
+  const nav = [];
+  if (page > 0) {
+    nav.push({ text: "\u2B05\uFE0F Prev", callback_data: `lr:p:${stateId}:${page - 1}` });
+  }
+  if (start + RULES_PER_PAGE < rules.length) {
+    nav.push({ text: "Next \u27A1\uFE0F", callback_data: `lr:p:${stateId}:${page + 1}` });
+  }
+  if (nav.length > 0) {
+    keyboard.push(nav);
+  }
+  return { inline_keyboard: keyboard };
+}
+function buildConfirmKeyboard(stateId, ruleIndex) {
+  return {
+    inline_keyboard: [
+      [{ text: "\u2705 Confirm", callback_data: `lr:x:${stateId}:${ruleIndex}` }],
+      [{ text: "\u274C Cancel", callback_data: `lr:z:${stateId}:0` }]
+    ]
+  };
+}
+async function loadListRoutesState(env, stateId) {
+  const raw = await env.DB.get(listRoutesStateKey(stateId));
+  return raw ? JSON.parse(raw) : null;
+}
+async function handleListRoutesCommand(message, env) {
+  const api = createTelegramBotAPI(env.TELEGRAM_TOKEN);
+  const chatId = message.chat.id;
+  if (!isAllowedChat(env, chatId)) {
+    return new Response(null, { status: 200 });
+  }
+  if (!env.CF_API_TOKEN) {
+    return api.sendMessage({ chat_id: chatId, text: "Cloudflare API is not enabled (CF_API_TOKEN missing)." });
+  }
+  const { domains } = await loadDomains(env);
+  if (domains.length === 0) {
+    return api.sendMessage({ chat_id: chatId, text: "No email routing domains found. Enable Email Routing on your zone first, and check CF_API_TOKEN permissions (Zone:Read, DNS:Read)." });
+  }
+  const stateId = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
+  const state = { chatId, domains };
+  await env.DB.put(listRoutesStateKey(stateId), JSON.stringify(state), { expirationTtl: STATE_TTL });
+  return api.sendMessage({
+    chat_id: chatId,
+    text: "Choose a domain to list routes:",
+    reply_markup: buildListRoutesDomainKeyboard(domains, stateId)
+  });
+}
+async function handleListRoutesCallback(callback, env) {
+  const api = createTelegramBotAPI(env.TELEGRAM_TOKEN);
+  const chatId = callback.message?.chat?.id;
+  const messageId = callback.message?.message_id;
+  const parsed = parseListRoutesCallbackData(callback.data || "");
+  if (!parsed || !chatId || !messageId) {
+    return;
+  }
+  if (!isAllowedChat(env, chatId) || !env.CF_API_TOKEN) {
+    await api.answerCallbackQuery({ callback_query_id: callback.id });
+    return;
+  }
+  const alert = (text) => api.answerCallbackQuery({
+    callback_query_id: callback.id,
+    text,
+    show_alert: true
+  });
+  const ack = () => api.answerCallbackQuery({ callback_query_id: callback.id });
+  const state = await loadListRoutesState(env, parsed.stateId);
+  if (!state || state.chatId !== chatId) {
+    await alert("Session expired, run /list_routes again.");
+    return;
+  }
+  const token2 = env.CF_API_TOKEN;
+  if (parsed.act === "d") {
+    const option2 = state.domains[parsed.index];
+    if (!option2) {
+      await alert("Invalid option.");
+      return;
+    }
+    const rules = (await listRoutingRules(token2, option2.zoneId)).filter((r2) => r2.source !== "wrangler");
+    state.domain = option2.domain;
+    state.zoneId = option2.zoneId;
+    state.rules = rules;
+    await env.DB.put(listRoutesStateKey(parsed.stateId), JSON.stringify(state), { expirationTtl: STATE_TTL });
+    const text = rules.length === 0 ? `No rules found for ${option2.domain}.` : `Routes for ${option2.domain}:`;
+    await api.editMessageText({
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      reply_markup: buildRulesKeyboard(rules, parsed.stateId, 0)
+    });
+    await ack();
+    return;
+  }
+  if (parsed.act === "p" || parsed.act === "z") {
+    if (!state.rules || !state.domain) {
+      await alert("Session expired, run /list_routes again.");
+      return;
+    }
+    await api.editMessageText({
+      chat_id: chatId,
+      message_id: messageId,
+      text: `Routes for ${state.domain}:`,
+      reply_markup: buildRulesKeyboard(state.rules, parsed.stateId, parsed.act === "z" ? 0 : parsed.page)
+    });
+    await ack();
+    return;
+  }
+  if (parsed.act === "c") {
+    const rule = state.rules?.[parsed.ruleIndex];
+    if (!rule || !state.domain) {
+      await alert("Invalid option.");
+      return;
+    }
+    await api.editMessageText({
+      chat_id: chatId,
+      message_id: messageId,
+      text: `\u{1F5D1} Delete ${rule.address} ${rule.actionLabel} ?`,
+      reply_markup: buildConfirmKeyboard(parsed.stateId, parsed.ruleIndex)
+    });
+    await ack();
+    return;
+  }
+  if (parsed.act === "x") {
+    const rule = state.rules?.[parsed.ruleIndex];
+    if (!rule || !state.zoneId || !state.domain) {
+      await alert("Invalid option.");
+      return;
+    }
+    await deleteRule(token2, state.zoneId, rule.id);
+    const rules = (await listRoutingRules(token2, state.zoneId)).filter((r2) => r2.source !== "wrangler");
+    state.rules = rules;
+    await env.DB.put(listRoutesStateKey(parsed.stateId), JSON.stringify(state), { expirationTtl: STATE_TTL });
+    const text = rules.length === 0 ? `\u2705 Deleted ${rule.address}. No rules left for ${state.domain}.` : `\u2705 Deleted ${rule.address}. Remaining rules for ${state.domain}:`;
+    await api.editMessageText({
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      reply_markup: buildRulesKeyboard(rules, parsed.stateId, 0)
+    });
+    await ack();
+  }
+}
+
 // src/telegram/telegram.ts
 function logTelegram(event, data) {
   console.log(`[telegram] ${event}${data ? ` ${JSON.stringify(data)}` : ""}`);
@@ -13425,6 +13989,7 @@ async function handleReplyEmailCommand(message, env) {
   }
 }
 async function telegramCommandHandler(message, env) {
+  const { TELEGRAM_TOKEN } = env;
   logTelegram("message.received", {
     chatId: message?.chat?.id,
     messageId: message?.message_id,
@@ -13432,6 +13997,9 @@ async function telegramCommandHandler(message, env) {
     hasText: !!message?.text,
     isReply: !!message?.reply_to_message
   });
+  if (await tryConsumeAwaitedPrefix(message, env)) {
+    return;
+  }
   if (message?.reply_to_message) {
     await handleReplyEmailCommand(message, env);
     return;
@@ -13447,7 +14015,29 @@ async function telegramCommandHandler(message, env) {
     start: handleIDCommand(env),
     test: handleOpenTMACommand("test", null, env),
     white: handleOpenTMACommand("white", null, env),
-    block: handleOpenTMACommand("block", null, env)
+    block: handleOpenTMACommand("block", null, env),
+    new_route: async (msg) => {
+      try {
+        return await handleNewRouteCommand(msg, env);
+      } catch (e) {
+        logTelegramError("command.new_route.error", e, { command, chatId: msg.chat.id, messageId: msg.message_id });
+        return await createTelegramBotAPI(TELEGRAM_TOKEN).sendMessage({
+          chat_id: msg.chat.id,
+          text: e.message
+        });
+      }
+    },
+    list_routes: async (msg) => {
+      try {
+        return await handleListRoutesCommand(msg, env);
+      } catch (e) {
+        logTelegramError("command.list_routes.error", e, { command, chatId: msg.chat.id, messageId: msg.message_id });
+        return await createTelegramBotAPI(TELEGRAM_TOKEN).sendMessage({
+          chat_id: msg.chat.id,
+          text: e.message
+        });
+      }
+    }
   };
   if (handlers[command]) {
     logTelegram("command.handle", { command, chatId: message.chat.id, messageId: message.message_id });
@@ -13527,6 +14117,34 @@ async function telegramCallbackHandler(callback, env) {
   };
   const [act, arg] = data.split(/:(.*)/);
   logTelegram("callback.parsed", { data, act, arg, chatId, messageId });
+  if (act === "nr") {
+    try {
+      await handleNewRouteCallback(callback, env);
+    } catch (e) {
+      logTelegramError("callback.new_route.error", e, { data, chatId, messageId });
+      const response = await api.answerCallbackQuery({
+        callback_query_id: callbackId,
+        text: e.message,
+        show_alert: true
+      });
+      await logTelegramResponse("answerCallbackQuery", response);
+    }
+    return;
+  }
+  if (act === "lr") {
+    try {
+      await handleListRoutesCallback(callback, env);
+    } catch (e) {
+      logTelegramError("callback.list_routes.error", e, { data, chatId, messageId });
+      const response = await api.answerCallbackQuery({
+        callback_query_id: callbackId,
+        text: e.message,
+        show_alert: true
+      });
+      await logTelegramResponse("answerCallbackQuery", response);
+    }
+    return;
+  }
   if (handlers[act]) {
     try {
       await handlers[act](arg);

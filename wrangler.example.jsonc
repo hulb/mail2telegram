@@ -31,5 +31,8 @@
         // "MAX_EMAIL_SIZE": "524288",
         "MAX_EMAIL_SIZE_POLICY": "truncate",
         "DEBUG": "false"
+        // CF_API_TOKEN 请用 `wrangler secret put CF_API_TOKEN` 设置，所需权限：
+        // Zone: Zone:Read, DNS:Read, Email Routing Rules:Edit（建议按 zone 限定范围）
+        // Account: Email Routing Addresses:Read, Workers Scripts:Read
     }
 }

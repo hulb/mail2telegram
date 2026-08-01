@@ -38,6 +38,7 @@ export interface Environment {
     SUMMARY_TARGET_LANG?: string;
     GUARDIAN_MODE?: string;
     RESEND_API_KEY?: string;
+    CF_API_TOKEN?: string;
     DB: KVNamespace;
     AI?: Ai;
     DEBUG?: string;
