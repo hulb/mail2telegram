@@ -13318,6 +13318,20 @@ async function sendEmail(token2, from, to, subject, text) {
 }
 
 // src/cloudflare/index.ts
+function hasMorePages(info, fetched, currentPage) {
+  if (!info) {
+    return false;
+  }
+  if (info.total_pages != null) {
+    return currentPage < info.total_pages;
+  }
+  if (info.total_count != null && info.total_count > 0) {
+    const perPage = info.per_page ?? (fetched || 50);
+    const totalPages = Math.ceil(info.total_count / perPage);
+    return currentPage < totalPages;
+  }
+  return false;
+}
 var API_BASE = "https://api.cloudflare.com/client/v4";
 var EMAIL_ROUTING_MX_PATTERN = /^[\w-]+\.mx\.cloudflare\.net\.?$/i;
 function validateEmailPrefix(prefix) {
@@ -13342,8 +13356,8 @@ function cfErrorMessage(res, data) {
 }
 async function cfFetchAllPages(token2, path) {
   const all2 = [];
-  let page = 1;
-  for (; ; ) {
+  const MAX_PAGES = 20;
+  for (let page = 1; page <= MAX_PAGES; page++) {
     const sep = path.includes("?") ? "&" : "?";
     const res = await fetch(`${API_BASE}${path}${sep}page=${page}&per_page=50`, {
       headers: { Authorization: `Bearer ${token2}` }
@@ -13356,11 +13370,11 @@ async function cfFetchAllPages(token2, path) {
       throw new Error(cfErrorMessage(res, data));
     }
     all2.push(...data.result);
-    if (page >= (data.result_info?.total_pages ?? 1)) {
+    if (!hasMorePages(data.result_info, data.result.length, page)) {
       return all2;
     }
-    page++;
   }
+  return all2;
 }
 async function listZones(token2) {
   const zones = await cfFetchAllPages(token2, "/zones?status=active");

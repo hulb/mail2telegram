@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { filterEmailRoutingMXRecords, isValidAddressLength, mapRoutingRuleResult, validateEmailPrefix } from './index';
+import { filterEmailRoutingMXRecords, hasMorePages, isValidAddressLength, mapRoutingRuleResult, validateEmailPrefix } from './index';
 
 function testValidateEmailPrefix() {
     assert.equal(validateEmailPrefix('admin'), true);
@@ -78,8 +78,27 @@ function testMapRoutingRuleResult() {
     console.log('testMapRoutingRuleResult ok');
 }
 
+function testHasMorePages() {
+    // total_pages 存在 → 按它判断
+    assert.equal(hasMorePages({ page: 1, total_pages: 3 }, 20, 1), true);
+    assert.equal(hasMorePages({ page: 3, total_pages: 3 }, 20, 3), false);
+    // total_pages 缺失但 total_count/per_page 存在（email routing rules 端点）→ 按 ceil(total/per_page) 判断
+    // 60 条、per_page=20 → 共 3 页
+    assert.equal(hasMorePages({ page: 1, per_page: 20, total_count: 60 }, 20, 1), true);
+    assert.equal(hasMorePages({ page: 2, per_page: 20, total_count: 60 }, 20, 2), true);
+    assert.equal(hasMorePages({ page: 3, per_page: 20, total_count: 60 }, 20, 3), false);
+    // 整除边界：40 条 / 20 每页 → 2 页
+    assert.equal(hasMorePages({ page: 2, per_page: 20, total_count: 40 }, 20, 2), false);
+    // per_page 缺失时用本页实取条数兜底
+    assert.equal(hasMorePages({ page: 1, total_count: 60 }, 20, 1), true);
+    // 无分页信息（workers scripts 一次返回全部）→ 不再翻页
+    assert.equal(hasMorePages(undefined, 60, 1), false);
+    console.log('testHasMorePages ok');
+}
+
 testValidateEmailPrefix();
 testIsValidAddressLength();
 testFilterEmailRoutingMXRecords();
 testFilterEmailRoutingMXRecordsByMeta();
 testMapRoutingRuleResult();
+testHasMorePages();
