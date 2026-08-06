@@ -86,9 +86,33 @@ Location: Workers & Pages - your_work_name - Settings - Variables
 | MAX_EMAIL_SIZE         | Maximum email size in bytes, emails exceeding this size will be processed according to `MAX_EMAIL_SIZE_POLICY`. The main purpose is to prevent the worker function from timing out due to too large attachments. Default is 512*1024.                                                                                                                                                                |
 | MAX_EMAIL_SIZE_POLICY  | The available values are `unhandled`, `truncate` and `continue`. `unhandled` means return the headers without parsing the message body, `truncate` means truncate the message body and only parse the allowed size, `continue` means continue to process the message regardless of the size limit. The default is `truncate`. This policy only affects Telegram push messages, not email forwarding. |
 | RESEND_API_KEY         | Resend API Key, https://resend.com/docs/introduction, Reply message to reply the email.                                                                                                                                                                                                                                                                                                              |
-| CF_API_TOKEN           | Cloudflare API Token for the `/new_route` command (create Email Routing rules from the bot). Required permissions: Zone `Zone:Read`, `DNS:Read`, `Email Routing Rules:Edit` (recommended to scope to specific zones); Account `Email Routing Addresses:Read`, `Workers Scripts:Read`. Set via `wrangler secret put CF_API_TOKEN`. The selectable domains are the zones visible to the token plus their email-routing subdomains (MX records managed by Email Routing). |
+| CF_API_TOKEN           | Cloudflare API Token for the `/new_route` and `/list_routes` commands (create, list and delete Email Routing rules from the bot). Required permissions: Zone `Zone:Read`, `DNS:Read`, `Email Routing Rules:Edit` (recommended to scope to specific zones); Account `Email Routing Addresses:Read`, `Workers Scripts:Read`. Set via `wrangler secret put CF_API_TOKEN`. The selectable domains are the zones visible to the token plus their email-routing subdomains (MX records managed by Email Routing). |
 | DB                     | Bind the database to the worker at the `KV Namespace Bindings` section. The `Variable Name` must be `DB`, and `KV Namespace` select any newly created KV.                                                                                                                                                                                                                                            |
 
+
+## Email Route Management
+
+The bot can create and delete Cloudflare Email Routing rules through Telegram buttons.
+
+> Both commands require `CF_API_TOKEN` (see Configuration) and only respond to the chat IDs in `TELEGRAM_ID`. After enabling, re-call `https://project_name.user_name.workers.dev/init` to register the new commands.
+
+### `/new_route <prefix>`
+
+Create a new email routing rule.
+
+1. Send `/new_route admin` (or `/new_route` and then send a prefix within 5 minutes) to create `admin@<domain>`.
+2. Choose the domain — the apex or email-routing subdomains visible to the token.
+3. Choose the target: a verified destination address (📧) or a worker with an `email()` handler (⚙️).
+4. The rule is created immediately; duplicate addresses are rejected.
+
+### `/list_routes`
+
+List and delete email routing rules.
+
+1. Send `/list_routes` and choose a domain.
+2. Rules of that domain are shown as buttons (10 per page); `⬅️ 域名` returns to the domain selection.
+3. Tap a rule, then confirm to delete it.
+4. Rules managed by wrangler (`source: wrangler`) are shown with a ⚠️ marker and cannot be deleted from the bot — edit them in `wrangler.jsonc` instead.
 
 ## Telegram Mini Apps
 
