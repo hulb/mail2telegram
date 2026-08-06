@@ -14,9 +14,28 @@ interface CloudflareAPIResponse<T> {
     errors: Array<{ code: number; message: string }>;
     result: T;
     result_info?: {
-        page: number;
-        total_pages: number;
+        page?: number;
+        per_page?: number;
+        total_count?: number;
+        total_pages?: number;
     };
+}
+
+// 分页终止判断：优先用 total_pages；缺失时用 total_count/per_page 计算；
+// 无分页信息（如 workers scripts 端点一次返回全部）→ 不再翻页。
+export function hasMorePages(info: CloudflareAPIResponse<unknown>['result_info'], fetched: number, currentPage: number): boolean {
+    if (!info) {
+        return false;
+    }
+    if (info.total_pages != null) {
+        return currentPage < info.total_pages;
+    }
+    if (info.total_count != null && info.total_count > 0) {
+        const perPage = info.per_page ?? (fetched || 50);
+        const totalPages = Math.ceil(info.total_count / perPage);
+        return currentPage < totalPages;
+    }
+    return false;
 }
 
 const API_BASE = 'https://api.cloudflare.com/client/v4';
@@ -56,8 +75,9 @@ function cfErrorMessage(res: Response, data: CloudflareAPIResponse<unknown> | nu
 
 async function cfFetchAllPages<T>(token: string, path: string): Promise<T[]> {
     const all: T[] = [];
-    let page = 1;
-    for (;;) {
+    // MAX_PAGES 保护：防止无分页信息端点（返回全部但忽略 page 参数）导致的死循环
+    const MAX_PAGES = 20;
+    for (let page = 1; page <= MAX_PAGES; page++) {
         const sep = path.includes('?') ? '&' : '?';
         const res = await fetch(`${API_BASE}${path}${sep}page=${page}&per_page=50`, {
             headers: { Authorization: `Bearer ${token}` },
@@ -70,11 +90,11 @@ async function cfFetchAllPages<T>(token: string, path: string): Promise<T[]> {
             throw new Error(cfErrorMessage(res, data));
         }
         all.push(...data.result);
-        if (page >= (data.result_info?.total_pages ?? 1)) {
+        if (!hasMorePages(data.result_info, data.result.length, page)) {
             return all;
         }
-        page++;
     }
+    return all;
 }
 
 interface ZoneResult {

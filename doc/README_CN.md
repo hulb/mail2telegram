@@ -80,8 +80,33 @@ mail2telegram
 | MAX_EMAIL_SIZE         | 最大邮件大小，单位字节，超过此大小的邮件将会根据`MAX_EMAIL_SIZE_POLICY`判断处理逻辑。主要作用是防止邮件附件过大导致worker函数超时。默认为512*1024                                                                           |
 | MAX_EMAIL_SIZE_POLICY  | 可选值为`unhandled`,`truncate`,`continute`。 `unhandled`表示不处理只返回邮件头信息不解析邮件正文，`truncate`表示截断邮件正文只解析允许的大小，`continute`表示继续处理不管大小限制。默认为`truncate`。这个策略只影响Telegram推送消息，不影响邮件转发。 |
 | RESEND_API_KEY         | Resend API Key, https://resend.com/docs/introduction, 回复消息以回复电子邮件。                                                                                                    |
+| CF_API_TOKEN           | Cloudflare API Token，用于 `/new_route` 与 `/list_routes` 命令（通过 bot 创建、列出和删除 Email Routing 规则）。所需权限：Zone 级 `Zone:Read`、`DNS:Read`、`Email Routing Rules:Edit`（建议按 zone 限定范围）；Account 级 `Email Routing Addresses:Read`、`Workers Scripts:Read`。通过 `wrangler secret put CF_API_TOKEN` 设置。可选域名 = token 可见的 zone + 其启用了 Email Routing 的子域名（以 MX 记录识别）。 |
 | DB                     | 在下方的 `KV 命名空间绑定` 处将数据库绑定到worker, `变量名称`必须为`DB`，`KV 命名空间`选新建好的任意KV                                                                                                     |
 
+
+## 邮箱路由管理
+
+可以通过 Telegram 按钮创建和删除 Cloudflare Email Routing 规则。
+
+> 两个命令都需要 `CF_API_TOKEN`（见上表），且只响应 `TELEGRAM_ID` 中配置的 Chat ID。启用后需重新调用 `https://project_name.user_name.workers.dev/init` 注册新命令。
+
+### `/new_route <前缀>`
+
+创建新的邮箱路由规则。
+
+1. 发送 `/new_route admin`（或先发 `/new_route`，再在 5 分钟内发送一个前缀），即可创建 `admin@<域名>`。
+2. 选择域名——token 可见的 zone（含启用了 Email Routing 的子域名）。
+3. 选择转发目标：已验证的转发邮箱（📧）或实现了 `email()` handler 的 worker（⚙️）。
+4. 立即创建规则；重复地址会被拒绝。
+
+### `/list_routes`
+
+列出并删除邮箱路由规则。
+
+1. 发送 `/list_routes` 并选择一个域名。
+2. 该域名下的规则以按钮形式展示（每页 10 条）；`⬅️ 域名` 可返回重新选择域名。
+3. 点击规则后再确认删除。
+4. 由 wrangler 管理的规则（`source: wrangler`）带 ⚠️ 标记且不能在 bot 中删除——请在 `wrangler.jsonc` 中修改。
 
 ## Telegram Mini Apps
 

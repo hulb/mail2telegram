@@ -16,7 +16,7 @@ export interface ListRoutesState {
 
 export type ListRoutesCallback
     = | { act: 'd'; stateId: string; index: number }
-        | { act: 'p' | 'z'; stateId: string; page: number }
+        | { act: 'p' | 'z' | 'b'; stateId: string; page: number }
         | { act: 'c' | 'x'; stateId: string; ruleIndex: number };
 
 export const RULES_PER_PAGE = 10;
@@ -37,7 +37,7 @@ export function parseListRoutesCallbackData(data: string): ListRoutesCallback | 
     if (act === 'd') {
         return { act, stateId, index: Number.parseInt(num, 10) };
     }
-    if (act === 'p' || act === 'z') {
+    if (act === 'p' || act === 'z' || act === 'b') {
         return { act, stateId, page: Number.parseInt(num, 10) };
     }
     if (act === 'c' || act === 'x') {
@@ -64,24 +64,27 @@ export function buildListRoutesDomainKeyboard(domains: NewRouteDomainOption[], s
     };
 }
 
+export function filterRulesByDomain(rules: RoutingRule[], domain: string): RoutingRule[] {
+    const suffix = `@${domain.toLowerCase()}`;
+    return rules.filter(r => r.address.toLowerCase().endsWith(suffix));
+}
+
 export function buildRulesKeyboard(rules: RoutingRule[], stateId: string, page: number): Telegram.InlineKeyboardMarkup {
     const start = page * RULES_PER_PAGE;
     const keyboard: Telegram.InlineKeyboardButton[][] = rules
         .slice(start, start + RULES_PER_PAGE)
         .map((r, i) => [{
-            text: buildRuleLabel(r),
+            text: r.source === 'wrangler' ? `⚠️ ${buildRuleLabel(r)}` : buildRuleLabel(r),
             callback_data: `lr:c:${stateId}:${start + i}`,
         }]);
-    const nav: Telegram.InlineKeyboardButton[] = [];
+    const nav: Telegram.InlineKeyboardButton[] = [{ text: '⬅️ 域名', callback_data: `lr:b:${stateId}:0` }];
     if (page > 0) {
         nav.push({ text: '⬅️ Prev', callback_data: `lr:p:${stateId}:${page - 1}` });
     }
     if (start + RULES_PER_PAGE < rules.length) {
         nav.push({ text: 'Next ➡️', callback_data: `lr:p:${stateId}:${page + 1}` });
     }
-    if (nav.length > 0) {
-        keyboard.push(nav);
-    }
+    keyboard.push(nav);
     return { inline_keyboard: keyboard };
 }
 
@@ -154,7 +157,7 @@ export async function handleListRoutesCallback(callback: Telegram.CallbackQuery,
             await alert('Invalid option.');
             return;
         }
-        const rules = (await listRoutingRules(token, option.zoneId)).filter(r => r.source !== 'wrangler');
+        const rules = filterRulesByDomain(await listRoutingRules(token, option.zoneId), option.domain);
         state.domain = option.domain;
         state.zoneId = option.zoneId;
         state.rules = rules;
@@ -165,6 +168,17 @@ export async function handleListRoutesCallback(callback: Telegram.CallbackQuery,
             message_id: messageId,
             text,
             reply_markup: buildRulesKeyboard(rules, parsed.stateId, 0),
+        });
+        await ack();
+        return;
+    }
+
+    if (parsed.act === 'b') {
+        await api.editMessageText({
+            chat_id: chatId,
+            message_id: messageId,
+            text: 'Choose a domain to list routes:',
+            reply_markup: buildListRoutesDomainKeyboard(state.domains, parsed.stateId),
         });
         await ack();
         return;
@@ -191,6 +205,10 @@ export async function handleListRoutesCallback(callback: Telegram.CallbackQuery,
             await alert('Invalid option.');
             return;
         }
+        if (rule.source === 'wrangler') {
+            await alert('⚠️ Managed by wrangler - edit it via wrangler.jsonc instead.');
+            return;
+        }
         await api.editMessageText({
             chat_id: chatId,
             message_id: messageId,
@@ -209,7 +227,7 @@ export async function handleListRoutesCallback(callback: Telegram.CallbackQuery,
             return;
         }
         await deleteRule(token, state.zoneId, rule.id);
-        const rules = (await listRoutingRules(token, state.zoneId)).filter(r => r.source !== 'wrangler');
+        const rules = filterRulesByDomain(await listRoutingRules(token, state.zoneId), state.domain);
         state.rules = rules;
         await env.DB.put(listRoutesStateKey(parsed.stateId), JSON.stringify(state), { expirationTtl: STATE_TTL });
         const text = rules.length === 0

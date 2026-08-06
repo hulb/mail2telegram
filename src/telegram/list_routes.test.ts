@@ -5,6 +5,7 @@ import {
     buildListRoutesDomainKeyboard,
     buildRuleLabel,
     buildRulesKeyboard,
+    filterRulesByDomain,
     parseListRoutesCallbackData,
     RULES_PER_PAGE,
 } from './list_routes';
@@ -15,12 +16,13 @@ function testParseListRoutesCallbackData() {
     assert.deepEqual(parseListRoutesCallbackData('lr:c:ab12cd34:5'), { act: 'c', stateId: 'ab12cd34', ruleIndex: 5 });
     assert.deepEqual(parseListRoutesCallbackData('lr:x:ab12cd34:5'), { act: 'x', stateId: 'ab12cd34', ruleIndex: 5 });
     assert.deepEqual(parseListRoutesCallbackData('lr:z:ab12cd34:0'), { act: 'z', stateId: 'ab12cd34', page: 0 });
+    assert.deepEqual(parseListRoutesCallbackData('lr:b:ab12cd34:0'), { act: 'b', stateId: 'ab12cd34', page: 0 });
     assert.equal(parseListRoutesCallbackData(''), null);
     assert.equal(parseListRoutesCallbackData('lr:x:ab12cd34'), null);
     assert.equal(parseListRoutesCallbackData('lr:x:ab12cd34:x'), null);
     assert.equal(parseListRoutesCallbackData('nr:d:ab12cd34:0'), null);
     assert.equal(parseListRoutesCallbackData('lr:x:AB12CD34:0'), null); // stateId 必须小写
-    for (const data of ['lr:d:ab12cd34:0', 'lr:p:ab12cd34:19', 'lr:x:ab12cd34:199']) {
+    for (const data of ['lr:d:ab12cd34:0', 'lr:p:ab12cd34:19', 'lr:x:ab12cd34:199', 'lr:b:ab12cd34:0']) {
         assert.ok(Buffer.byteLength(data) <= 64, `${data} exceeds 64 bytes`);
     }
     console.log('testParseListRoutesCallbackData ok');
@@ -60,24 +62,31 @@ function testBuildRulesKeyboardPagination() {
     assert.equal(page0.inline_keyboard.length, RULES_PER_PAGE + 1);
     assert.equal(page0.inline_keyboard[0][0].callback_data, 'lr:c:ab12cd34:0');
     const nav0 = page0.inline_keyboard[RULES_PER_PAGE];
-    assert.equal(nav0.length, 1);
-    assert.equal(nav0[0].callback_data, 'lr:p:ab12cd34:1');
+    assert.equal(nav0.length, 2);
+    assert.equal(nav0[0].callback_data, 'lr:b:ab12cd34:0'); // 返回域名选择
+    assert.equal(nav0[0].text, '⬅️ 域名');
+    assert.equal(nav0[1].callback_data, 'lr:p:ab12cd34:1');
 
     const page1 = buildRulesKeyboard(rules, 'ab12cd34', 1);
     assert.equal(page1.inline_keyboard[0][0].callback_data, 'lr:c:ab12cd34:10');
     const nav1 = page1.inline_keyboard[RULES_PER_PAGE];
-    assert.equal(nav1.length, 2);
-    assert.equal(nav1[0].callback_data, 'lr:p:ab12cd34:0');
-    assert.equal(nav1[1].callback_data, 'lr:p:ab12cd34:2');
+    assert.equal(nav1.length, 3);
+    assert.equal(nav1[0].callback_data, 'lr:b:ab12cd34:0');
+    assert.equal(nav1[1].callback_data, 'lr:p:ab12cd34:0');
+    assert.equal(nav1[2].callback_data, 'lr:p:ab12cd34:2');
 
     const page2 = buildRulesKeyboard(rules, 'ab12cd34', 2);
     assert.equal(page2.inline_keyboard.length, 5 + 1);
     const nav2 = page2.inline_keyboard[5];
-    assert.equal(nav2.length, 1);
-    assert.equal(nav2[0].callback_data, 'lr:p:ab12cd34:1');
+    assert.equal(nav2.length, 2);
+    assert.equal(nav2[0].callback_data, 'lr:b:ab12cd34:0');
+    assert.equal(nav2[1].callback_data, 'lr:p:ab12cd34:1');
 
-    // 空列表 → 空键盘
-    assert.deepEqual(buildRulesKeyboard([], 'ab12cd34', 0).inline_keyboard, []);
+    // 空列表 → 仅一行"返回域名选择"按钮，方便重新选域名
+    const empty = buildRulesKeyboard([], 'ab12cd34', 0);
+    assert.deepEqual(empty.inline_keyboard, [
+        [{ text: '⬅️ 域名', callback_data: 'lr:b:ab12cd34:0' }],
+    ]);
     console.log('testBuildRulesKeyboardPagination ok');
 }
 
@@ -90,8 +99,41 @@ function testBuildConfirmKeyboard() {
     console.log('testBuildConfirmKeyboard ok');
 }
 
+function testFilterRulesByDomain() {
+    const mk = (id: string, address: string, source = 'api'): RoutingRule => ({ id, address, actionLabel: '→ x@y.com', source });
+    const rules = [
+        mk('r1', 'admin@domain.com'),
+        mk('r2', 'info@domain.com'),
+        mk('r3', 'admin@sub.domain.com'),
+        mk('r4', 'Admin@DOMAIN.com'), // 大小写不同也应命中
+        mk('r5', 'x@other.com'),
+    ];
+    assert.deepEqual(filterRulesByDomain(rules, 'domain.com').map(r => r.id), ['r1', 'r2', 'r4']);
+    assert.deepEqual(filterRulesByDomain(rules, 'sub.domain.com').map(r => r.id), ['r3']);
+    assert.deepEqual(filterRulesByDomain(rules, 'nope.com'), []);
+    assert.deepEqual(filterRulesByDomain([], 'domain.com'), []);
+    // 子域名规则不会被 apex 域名误匹配（@sub.domain.com 不以 @domain.com 结尾）
+    assert.ok(!filterRulesByDomain([mk('r9', 'a@sub.domain.com')], 'domain.com').some(r => r.id === 'r9'));
+    console.log('testFilterRulesByDomain ok');
+}
+
+function testBuildRulesKeyboardWranglerMark() {
+    const rules: RoutingRule[] = [
+        { id: 'r1', address: 'a@b.com', actionLabel: '→ x@y.com', source: 'api' },
+        { id: 'r2', address: 'w@b.com', actionLabel: '→ worker wk', source: 'wrangler' },
+    ];
+    const kb = buildRulesKeyboard(rules, 'ab12cd34', 0);
+    assert.equal(kb.inline_keyboard[0][0].text, '📧 a@b.com → x@y.com');
+    assert.equal(kb.inline_keyboard[1][0].text, '⚠️ ⚙️ w@b.com → worker wk');
+    // wrangler 规则同样走 lr:c 回调，由 handler 在 c 分支拦截提示
+    assert.equal(kb.inline_keyboard[1][0].callback_data, 'lr:c:ab12cd34:1');
+    console.log('testBuildRulesKeyboardWranglerMark ok');
+}
+
 testParseListRoutesCallbackData();
 testBuildRuleLabel();
 testBuildListRoutesDomainKeyboard();
 testBuildRulesKeyboardPagination();
 testBuildConfirmKeyboard();
+testFilterRulesByDomain();
+testBuildRulesKeyboardWranglerMark();

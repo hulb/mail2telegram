@@ -26,8 +26,9 @@ bot : ✅ Deleted. 剩余规则重新列出（可继续删）
 
 - 每步 `editMessageText` 更新同一条消息。
 - 权限：命令与 `lr:` callback 仅响应 `TELEGRAM_ID`（逗号分隔）内的 chat id，其他用户静默忽略。
+- 规则按所选域名过滤（`rule.address` 以 `@{domain}` 结尾，大小写不敏感）：选 apex 只显示该 apex 规则，选子域名只显示该子域名规则。
+- `source === 'wrangler'` 的规则**显示但禁删**：按钮带 ⚠️ 标记，点击提示 "Managed by wrangler - edit it via wrangler.jsonc instead."（wrangler 托管规则不能用 API 删除）。
 - 无规则 → 消息 "No rules found for {domain}."。
-- `source === 'wrangler'` 的规则**跳过不显示**（wrangler 托管规则不能用 API 删除）。
 
 ## 架构与组件
 
@@ -40,6 +41,7 @@ bot : ✅ Deleted. 剩余规则重新列出（可继续删）
 ### 新文件 `src/telegram/list_routes.ts`
 
 - 纯函数（可测）：
+  - `filterRulesByDomain(rules, domain)` —— 保留 `rule.address` 以 `@{domain}` 结尾的规则（大小写不敏感）；选择 apex 或子域名时列表按此过滤，删除后重拉同样过滤。
   - `parseListRoutesCallbackData(data: string): ListRoutesCallback | null`
     - `type ListRoutesCallback = { act: 'd'; stateId: string; index: number } | { act: 'p' | 'z'; stateId: string; page: number } | { act: 'c' | 'x'; stateId: string; ruleIndex: number }`
     - 协议：`lr:d:{stateId}:{idx}`、`lr:p:{stateId}:{page}`、`lr:c:{stateId}:{ruleIdx}`、`lr:x:{stateId}:{ruleIdx}`、`lr:z:{stateId}:0`
@@ -87,4 +89,4 @@ lr:z:{sid}:0     → 编辑回规则列表页0
 
 ## 不做的事（YAGNI）
 
-- 不做多选批量删除、不做规则编辑、不管理 catch-all、不处理 `source === 'wrangler'` 的规则（跳过）。
+- 不做多选批量删除、不做规则编辑、不管理 catch-all。`source === 'wrangler'` 的规则只读展示（带 ⚠️ 标记），不提供删除入口。

@@ -13318,6 +13318,20 @@ async function sendEmail(token2, from, to, subject, text) {
 }
 
 // src/cloudflare/index.ts
+function hasMorePages(info, fetched, currentPage) {
+  if (!info) {
+    return false;
+  }
+  if (info.total_pages != null) {
+    return currentPage < info.total_pages;
+  }
+  if (info.total_count != null && info.total_count > 0) {
+    const perPage = info.per_page ?? (fetched || 50);
+    const totalPages = Math.ceil(info.total_count / perPage);
+    return currentPage < totalPages;
+  }
+  return false;
+}
 var API_BASE = "https://api.cloudflare.com/client/v4";
 var EMAIL_ROUTING_MX_PATTERN = /^[\w-]+\.mx\.cloudflare\.net\.?$/i;
 function validateEmailPrefix(prefix) {
@@ -13342,8 +13356,8 @@ function cfErrorMessage(res, data) {
 }
 async function cfFetchAllPages(token2, path) {
   const all2 = [];
-  let page = 1;
-  for (; ; ) {
+  const MAX_PAGES = 20;
+  for (let page = 1; page <= MAX_PAGES; page++) {
     const sep = path.includes("?") ? "&" : "?";
     const res = await fetch(`${API_BASE}${path}${sep}page=${page}&per_page=50`, {
       headers: { Authorization: `Bearer ${token2}` }
@@ -13356,11 +13370,11 @@ async function cfFetchAllPages(token2, path) {
       throw new Error(cfErrorMessage(res, data));
     }
     all2.push(...data.result);
-    if (page >= (data.result_info?.total_pages ?? 1)) {
+    if (!hasMorePages(data.result_info, data.result.length, page)) {
       return all2;
     }
-    page++;
   }
+  return all2;
 }
 async function listZones(token2) {
   const zones = await cfFetchAllPages(token2, "/zones?status=active");
@@ -13706,7 +13720,7 @@ function parseListRoutesCallbackData(data) {
   if (act === "d") {
     return { act, stateId, index: Number.parseInt(num, 10) };
   }
-  if (act === "p" || act === "z") {
+  if (act === "p" || act === "z" || act === "b") {
     return { act, stateId, page: Number.parseInt(num, 10) };
   }
   if (act === "c" || act === "x") {
@@ -13726,22 +13740,24 @@ function buildListRoutesDomainKeyboard(domains, stateId) {
     }])
   };
 }
+function filterRulesByDomain(rules, domain) {
+  const suffix = `@${domain.toLowerCase()}`;
+  return rules.filter((r2) => r2.address.toLowerCase().endsWith(suffix));
+}
 function buildRulesKeyboard(rules, stateId, page) {
   const start = page * RULES_PER_PAGE;
   const keyboard = rules.slice(start, start + RULES_PER_PAGE).map((r2, i2) => [{
-    text: buildRuleLabel(r2),
+    text: r2.source === "wrangler" ? `\u26A0\uFE0F ${buildRuleLabel(r2)}` : buildRuleLabel(r2),
     callback_data: `lr:c:${stateId}:${start + i2}`
   }]);
-  const nav = [];
+  const nav = [{ text: "\u2B05\uFE0F \u57DF\u540D", callback_data: `lr:b:${stateId}:0` }];
   if (page > 0) {
     nav.push({ text: "\u2B05\uFE0F Prev", callback_data: `lr:p:${stateId}:${page - 1}` });
   }
   if (start + RULES_PER_PAGE < rules.length) {
     nav.push({ text: "Next \u27A1\uFE0F", callback_data: `lr:p:${stateId}:${page + 1}` });
   }
-  if (nav.length > 0) {
-    keyboard.push(nav);
-  }
+  keyboard.push(nav);
   return { inline_keyboard: keyboard };
 }
 function buildConfirmKeyboard(stateId, ruleIndex) {
@@ -13808,7 +13824,7 @@ async function handleListRoutesCallback(callback, env) {
       await alert("Invalid option.");
       return;
     }
-    const rules = (await listRoutingRules(token2, option2.zoneId)).filter((r2) => r2.source !== "wrangler");
+    const rules = filterRulesByDomain(await listRoutingRules(token2, option2.zoneId), option2.domain);
     state.domain = option2.domain;
     state.zoneId = option2.zoneId;
     state.rules = rules;
@@ -13819,6 +13835,16 @@ async function handleListRoutesCallback(callback, env) {
       message_id: messageId,
       text,
       reply_markup: buildRulesKeyboard(rules, parsed.stateId, 0)
+    });
+    await ack();
+    return;
+  }
+  if (parsed.act === "b") {
+    await api.editMessageText({
+      chat_id: chatId,
+      message_id: messageId,
+      text: "Choose a domain to list routes:",
+      reply_markup: buildListRoutesDomainKeyboard(state.domains, parsed.stateId)
     });
     await ack();
     return;
@@ -13843,6 +13869,10 @@ async function handleListRoutesCallback(callback, env) {
       await alert("Invalid option.");
       return;
     }
+    if (rule.source === "wrangler") {
+      await alert("\u26A0\uFE0F Managed by wrangler - edit it via wrangler.jsonc instead.");
+      return;
+    }
     await api.editMessageText({
       chat_id: chatId,
       message_id: messageId,
@@ -13859,7 +13889,7 @@ async function handleListRoutesCallback(callback, env) {
       return;
     }
     await deleteRule(token2, state.zoneId, rule.id);
-    const rules = (await listRoutingRules(token2, state.zoneId)).filter((r2) => r2.source !== "wrangler");
+    const rules = filterRulesByDomain(await listRoutingRules(token2, state.zoneId), state.domain);
     state.rules = rules;
     await env.DB.put(listRoutesStateKey(parsed.stateId), JSON.stringify(state), { expirationTtl: STATE_TTL });
     const text = rules.length === 0 ? `\u2705 Deleted ${rule.address}. No rules left for ${state.domain}.` : `\u2705 Deleted ${rule.address}. Remaining rules for ${state.domain}:`;
