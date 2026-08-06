@@ -64,12 +64,17 @@ export function buildListRoutesDomainKeyboard(domains: NewRouteDomainOption[], s
     };
 }
 
+export function filterRulesByDomain(rules: RoutingRule[], domain: string): RoutingRule[] {
+    const suffix = `@${domain.toLowerCase()}`;
+    return rules.filter(r => r.address.toLowerCase().endsWith(suffix));
+}
+
 export function buildRulesKeyboard(rules: RoutingRule[], stateId: string, page: number): Telegram.InlineKeyboardMarkup {
     const start = page * RULES_PER_PAGE;
     const keyboard: Telegram.InlineKeyboardButton[][] = rules
         .slice(start, start + RULES_PER_PAGE)
         .map((r, i) => [{
-            text: buildRuleLabel(r),
+            text: r.source === 'wrangler' ? `⚠️ ${buildRuleLabel(r)}` : buildRuleLabel(r),
             callback_data: `lr:c:${stateId}:${start + i}`,
         }]);
     const nav: Telegram.InlineKeyboardButton[] = [];
@@ -154,7 +159,7 @@ export async function handleListRoutesCallback(callback: Telegram.CallbackQuery,
             await alert('Invalid option.');
             return;
         }
-        const rules = (await listRoutingRules(token, option.zoneId)).filter(r => r.source !== 'wrangler');
+        const rules = filterRulesByDomain(await listRoutingRules(token, option.zoneId), option.domain);
         state.domain = option.domain;
         state.zoneId = option.zoneId;
         state.rules = rules;
@@ -191,6 +196,10 @@ export async function handleListRoutesCallback(callback: Telegram.CallbackQuery,
             await alert('Invalid option.');
             return;
         }
+        if (rule.source === 'wrangler') {
+            await alert('⚠️ Managed by wrangler - edit it via wrangler.jsonc instead.');
+            return;
+        }
         await api.editMessageText({
             chat_id: chatId,
             message_id: messageId,
@@ -209,7 +218,7 @@ export async function handleListRoutesCallback(callback: Telegram.CallbackQuery,
             return;
         }
         await deleteRule(token, state.zoneId, rule.id);
-        const rules = (await listRoutingRules(token, state.zoneId)).filter(r => r.source !== 'wrangler');
+        const rules = filterRulesByDomain(await listRoutingRules(token, state.zoneId), state.domain);
         state.rules = rules;
         await env.DB.put(listRoutesStateKey(parsed.stateId), JSON.stringify(state), { expirationTtl: STATE_TTL });
         const text = rules.length === 0

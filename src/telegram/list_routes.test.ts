@@ -5,6 +5,7 @@ import {
     buildListRoutesDomainKeyboard,
     buildRuleLabel,
     buildRulesKeyboard,
+    filterRulesByDomain,
     parseListRoutesCallbackData,
     RULES_PER_PAGE,
 } from './list_routes';
@@ -90,8 +91,41 @@ function testBuildConfirmKeyboard() {
     console.log('testBuildConfirmKeyboard ok');
 }
 
+function testFilterRulesByDomain() {
+    const mk = (id: string, address: string, source = 'api'): RoutingRule => ({ id, address, actionLabel: '→ x@y.com', source });
+    const rules = [
+        mk('r1', 'admin@domain.com'),
+        mk('r2', 'info@domain.com'),
+        mk('r3', 'admin@sub.domain.com'),
+        mk('r4', 'Admin@DOMAIN.com'), // 大小写不同也应命中
+        mk('r5', 'x@other.com'),
+    ];
+    assert.deepEqual(filterRulesByDomain(rules, 'domain.com').map(r => r.id), ['r1', 'r2', 'r4']);
+    assert.deepEqual(filterRulesByDomain(rules, 'sub.domain.com').map(r => r.id), ['r3']);
+    assert.deepEqual(filterRulesByDomain(rules, 'nope.com'), []);
+    assert.deepEqual(filterRulesByDomain([], 'domain.com'), []);
+    // 子域名规则不会被 apex 域名误匹配（@sub.domain.com 不以 @domain.com 结尾）
+    assert.ok(!filterRulesByDomain([mk('r9', 'a@sub.domain.com')], 'domain.com').some(r => r.id === 'r9'));
+    console.log('testFilterRulesByDomain ok');
+}
+
+function testBuildRulesKeyboardWranglerMark() {
+    const rules: RoutingRule[] = [
+        { id: 'r1', address: 'a@b.com', actionLabel: '→ x@y.com', source: 'api' },
+        { id: 'r2', address: 'w@b.com', actionLabel: '→ worker wk', source: 'wrangler' },
+    ];
+    const kb = buildRulesKeyboard(rules, 'ab12cd34', 0);
+    assert.equal(kb.inline_keyboard[0][0].text, '📧 a@b.com → x@y.com');
+    assert.equal(kb.inline_keyboard[1][0].text, '⚠️ ⚙️ w@b.com → worker wk');
+    // wrangler 规则同样走 lr:c 回调，由 handler 在 c 分支拦截提示
+    assert.equal(kb.inline_keyboard[1][0].callback_data, 'lr:c:ab12cd34:1');
+    console.log('testBuildRulesKeyboardWranglerMark ok');
+}
+
 testParseListRoutesCallbackData();
 testBuildRuleLabel();
 testBuildListRoutesDomainKeyboard();
 testBuildRulesKeyboardPagination();
 testBuildConfirmKeyboard();
+testFilterRulesByDomain();
+testBuildRulesKeyboardWranglerMark();

@@ -13726,10 +13726,14 @@ function buildListRoutesDomainKeyboard(domains, stateId) {
     }])
   };
 }
+function filterRulesByDomain(rules, domain) {
+  const suffix = `@${domain.toLowerCase()}`;
+  return rules.filter((r2) => r2.address.toLowerCase().endsWith(suffix));
+}
 function buildRulesKeyboard(rules, stateId, page) {
   const start = page * RULES_PER_PAGE;
   const keyboard = rules.slice(start, start + RULES_PER_PAGE).map((r2, i2) => [{
-    text: buildRuleLabel(r2),
+    text: r2.source === "wrangler" ? `\u26A0\uFE0F ${buildRuleLabel(r2)}` : buildRuleLabel(r2),
     callback_data: `lr:c:${stateId}:${start + i2}`
   }]);
   const nav = [];
@@ -13808,7 +13812,7 @@ async function handleListRoutesCallback(callback, env) {
       await alert("Invalid option.");
       return;
     }
-    const rules = (await listRoutingRules(token2, option2.zoneId)).filter((r2) => r2.source !== "wrangler");
+    const rules = filterRulesByDomain(await listRoutingRules(token2, option2.zoneId), option2.domain);
     state.domain = option2.domain;
     state.zoneId = option2.zoneId;
     state.rules = rules;
@@ -13843,6 +13847,10 @@ async function handleListRoutesCallback(callback, env) {
       await alert("Invalid option.");
       return;
     }
+    if (rule.source === "wrangler") {
+      await alert("\u26A0\uFE0F Managed by wrangler - edit it via wrangler.jsonc instead.");
+      return;
+    }
     await api.editMessageText({
       chat_id: chatId,
       message_id: messageId,
@@ -13859,7 +13867,7 @@ async function handleListRoutesCallback(callback, env) {
       return;
     }
     await deleteRule(token2, state.zoneId, rule.id);
-    const rules = (await listRoutingRules(token2, state.zoneId)).filter((r2) => r2.source !== "wrangler");
+    const rules = filterRulesByDomain(await listRoutingRules(token2, state.zoneId), state.domain);
     state.rules = rules;
     await env.DB.put(listRoutesStateKey(parsed.stateId), JSON.stringify(state), { expirationTtl: STATE_TTL });
     const text = rules.length === 0 ? `\u2705 Deleted ${rule.address}. No rules left for ${state.domain}.` : `\u2705 Deleted ${rule.address}. Remaining rules for ${state.domain}:`;
