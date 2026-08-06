@@ -13720,7 +13720,7 @@ function parseListRoutesCallbackData(data) {
   if (act === "d") {
     return { act, stateId, index: Number.parseInt(num, 10) };
   }
-  if (act === "p" || act === "z") {
+  if (act === "p" || act === "z" || act === "b") {
     return { act, stateId, page: Number.parseInt(num, 10) };
   }
   if (act === "c" || act === "x") {
@@ -13750,16 +13750,14 @@ function buildRulesKeyboard(rules, stateId, page) {
     text: r2.source === "wrangler" ? `\u26A0\uFE0F ${buildRuleLabel(r2)}` : buildRuleLabel(r2),
     callback_data: `lr:c:${stateId}:${start + i2}`
   }]);
-  const nav = [];
+  const nav = [{ text: "\u2B05\uFE0F \u57DF\u540D", callback_data: `lr:b:${stateId}:0` }];
   if (page > 0) {
     nav.push({ text: "\u2B05\uFE0F Prev", callback_data: `lr:p:${stateId}:${page - 1}` });
   }
   if (start + RULES_PER_PAGE < rules.length) {
     nav.push({ text: "Next \u27A1\uFE0F", callback_data: `lr:p:${stateId}:${page + 1}` });
   }
-  if (nav.length > 0) {
-    keyboard.push(nav);
-  }
+  keyboard.push(nav);
   return { inline_keyboard: keyboard };
 }
 function buildConfirmKeyboard(stateId, ruleIndex) {
@@ -13837,6 +13835,16 @@ async function handleListRoutesCallback(callback, env) {
       message_id: messageId,
       text,
       reply_markup: buildRulesKeyboard(rules, parsed.stateId, 0)
+    });
+    await ack();
+    return;
+  }
+  if (parsed.act === "b") {
+    await api.editMessageText({
+      chat_id: chatId,
+      message_id: messageId,
+      text: "Choose a domain to list routes:",
+      reply_markup: buildListRoutesDomainKeyboard(state.domains, parsed.stateId)
     });
     await ack();
     return;

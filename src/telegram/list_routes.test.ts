@@ -16,12 +16,13 @@ function testParseListRoutesCallbackData() {
     assert.deepEqual(parseListRoutesCallbackData('lr:c:ab12cd34:5'), { act: 'c', stateId: 'ab12cd34', ruleIndex: 5 });
     assert.deepEqual(parseListRoutesCallbackData('lr:x:ab12cd34:5'), { act: 'x', stateId: 'ab12cd34', ruleIndex: 5 });
     assert.deepEqual(parseListRoutesCallbackData('lr:z:ab12cd34:0'), { act: 'z', stateId: 'ab12cd34', page: 0 });
+    assert.deepEqual(parseListRoutesCallbackData('lr:b:ab12cd34:0'), { act: 'b', stateId: 'ab12cd34', page: 0 });
     assert.equal(parseListRoutesCallbackData(''), null);
     assert.equal(parseListRoutesCallbackData('lr:x:ab12cd34'), null);
     assert.equal(parseListRoutesCallbackData('lr:x:ab12cd34:x'), null);
     assert.equal(parseListRoutesCallbackData('nr:d:ab12cd34:0'), null);
     assert.equal(parseListRoutesCallbackData('lr:x:AB12CD34:0'), null); // stateId 必须小写
-    for (const data of ['lr:d:ab12cd34:0', 'lr:p:ab12cd34:19', 'lr:x:ab12cd34:199']) {
+    for (const data of ['lr:d:ab12cd34:0', 'lr:p:ab12cd34:19', 'lr:x:ab12cd34:199', 'lr:b:ab12cd34:0']) {
         assert.ok(Buffer.byteLength(data) <= 64, `${data} exceeds 64 bytes`);
     }
     console.log('testParseListRoutesCallbackData ok');
@@ -61,24 +62,31 @@ function testBuildRulesKeyboardPagination() {
     assert.equal(page0.inline_keyboard.length, RULES_PER_PAGE + 1);
     assert.equal(page0.inline_keyboard[0][0].callback_data, 'lr:c:ab12cd34:0');
     const nav0 = page0.inline_keyboard[RULES_PER_PAGE];
-    assert.equal(nav0.length, 1);
-    assert.equal(nav0[0].callback_data, 'lr:p:ab12cd34:1');
+    assert.equal(nav0.length, 2);
+    assert.equal(nav0[0].callback_data, 'lr:b:ab12cd34:0'); // 返回域名选择
+    assert.equal(nav0[0].text, '⬅️ 域名');
+    assert.equal(nav0[1].callback_data, 'lr:p:ab12cd34:1');
 
     const page1 = buildRulesKeyboard(rules, 'ab12cd34', 1);
     assert.equal(page1.inline_keyboard[0][0].callback_data, 'lr:c:ab12cd34:10');
     const nav1 = page1.inline_keyboard[RULES_PER_PAGE];
-    assert.equal(nav1.length, 2);
-    assert.equal(nav1[0].callback_data, 'lr:p:ab12cd34:0');
-    assert.equal(nav1[1].callback_data, 'lr:p:ab12cd34:2');
+    assert.equal(nav1.length, 3);
+    assert.equal(nav1[0].callback_data, 'lr:b:ab12cd34:0');
+    assert.equal(nav1[1].callback_data, 'lr:p:ab12cd34:0');
+    assert.equal(nav1[2].callback_data, 'lr:p:ab12cd34:2');
 
     const page2 = buildRulesKeyboard(rules, 'ab12cd34', 2);
     assert.equal(page2.inline_keyboard.length, 5 + 1);
     const nav2 = page2.inline_keyboard[5];
-    assert.equal(nav2.length, 1);
-    assert.equal(nav2[0].callback_data, 'lr:p:ab12cd34:1');
+    assert.equal(nav2.length, 2);
+    assert.equal(nav2[0].callback_data, 'lr:b:ab12cd34:0');
+    assert.equal(nav2[1].callback_data, 'lr:p:ab12cd34:1');
 
-    // 空列表 → 空键盘
-    assert.deepEqual(buildRulesKeyboard([], 'ab12cd34', 0).inline_keyboard, []);
+    // 空列表 → 仅一行"返回域名选择"按钮，方便重新选域名
+    const empty = buildRulesKeyboard([], 'ab12cd34', 0);
+    assert.deepEqual(empty.inline_keyboard, [
+        [{ text: '⬅️ 域名', callback_data: 'lr:b:ab12cd34:0' }],
+    ]);
     console.log('testBuildRulesKeyboardPagination ok');
 }
 
